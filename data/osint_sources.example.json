@@ -1,0 +1,22 @@
+[
+  {
+    "name": "example-news-rss",
+    "url": "https://example.org/karachi/feed.xml",
+    "kind": "rss",
+    "max_items": 50
+  },
+  {
+    "name": "example-complaints-portal",
+    "url": "https://example.org/public-complaints",
+    "kind": "html",
+    "selectors": {
+      "item": "div.complaint",
+      "text": ".description",
+      "link": "a.permalink",
+      "time": "time",
+      "image": "img.attachment",
+      "author": ".reporter"
+    },
+    "max_items": 30
+  }
+]

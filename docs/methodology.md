@@ -19,3 +19,19 @@
 **Database persistence**: every image/video analyzed in AI Analysis Lab is now saved as a real (non-synthetic) observation to the local SQLite database (`database/db.py`), browsable and exportable from the new Data Explorer page.
 
 **Error analysis** (`evaluation/metrics.py::evaluate_with_conditions`) extends the live evaluation tool: if uploaded ground truth tags each image with condition labels (rain, low_light, blur, occlusion, unusual_angle, night, heavy_traffic — or custom tags), Model Lab computes a real, separately-measured F1/precision/recall for every condition, not just one averaged overall score. An image tagged with multiple conditions counts in every bucket it's tagged with. The plain (untagged) ground-truth format remains fully supported, bucketed as "unspecified." This closes the last item from the original functional spec that could be built without real field data — everything beyond this point (a trained hazard model, real Karachi observations) requires actual data collection, not further engineering.
+
+---
+
+## v2 additions (multi-modal pipeline)
+
+Full specification: `docs/multimodal_fusion.md`. Summary:
+
+**Edge runtime.** `computer_vision/edge_onnx.py` runs an exported YOLOv8-nano with ONNX Runtime on CPU (no PyTorch, no server): letterbox, single-call blob preprocessing, YOLOv8 head decoding, NumPy class-aware NMS with a bounded candidate count, latency benchmark, and INT8 static quantization that refuses to run without real calibration images and is always followed by an INT8-vs-FP32 agreement check. No trained hazard weights ship with the repository; the module is the deployment path for the weights you train (`scripts/train_edge_model.py`).
+
+**OSINT pipeline.** `scripts/osint_pipeline.py` collects public civic-hazard reports asynchronously and politely (robots.txt, per-host rate limits, backoff, circuit breaker), analyses them with a transparent English/Roman-Urdu/Urdu lexicon (`scripts/osint_text.py`), geocodes them offline (`geospatial/gazetteer.py`), pseudonymises authors, removes contact details and flags near-duplicates. A deterministic mock stream makes the whole pipeline runnable offline; everything it generates is flagged synthetic.
+
+**Satellite fusion.** `geospatial/satellite.py` cross-checks area-scale waterlogging reports against Sentinel-2 L2A (Planetary Computer): NDWI/NDVI change versus a dry-period median baseline, SCL cloud masking, speckle removal, and four explicit verdicts (`CONFIRMED_WET`, `NO_CHANGE`, `INCONCLUSIVE`, `NOT_APPLICABLE`). Clouds and unobservable hazards are never treated as evidence of absence.
+
+**Evidence fusion.** `risk_engine/fusion.py` fuses CV, community and satellite evidence with capped, time-decayed noisy-OR over *independent* sources, an explicit contradiction rule, and impact computed only from known components. The result is a 5x5 likelihood-by-impact risk matrix stored in append-only SQLite tables and recorded in a hash-chained ledger (`database/db.py`) - tamper-evident, not tamper-proof.
+
+**Limitations (v2).** Text analysis is a lexicon, not a trained model; gazetteer coordinates are approximate; satellite thresholds, fusion weights, caps and half-lives are expert-set and uncalibrated; noisy-OR assumes independent modalities; the live satellite provider needs network access and optional packages; no accuracy figure is claimed for any v2 component.

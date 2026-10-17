@@ -1,0 +1,17 @@
+# Example Ultralytics/YOLO dataset config for the Karachi hazard detector.
+# Copy to data/hazard_dataset.yaml and point `path` at your labelled data. This repository ships NO images.
+#
+# Layout expected under `path` (YOLO format: one .txt per image, lines "class cx cy w h" normalised 0-1):
+#   images/train  images/val  images/test
+#   labels/train  labels/val  labels/test
+#
+# IMPORTANT: build train/val/test with scripts/dataset_tools.py::geographic_split so frames of the same street
+# never appear in both train and test.
+path: data/hazard_dataset
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: pothole
+  1: open_manhole
+  2: sewage_overflow

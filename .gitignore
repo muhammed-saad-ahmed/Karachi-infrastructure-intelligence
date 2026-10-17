@@ -1,8 +1,14 @@
 .env
 __pycache__/
+*.pyc
 *.db
+*.db-wal
+*.db-shm
 data/raw/*
 *.pt
 .venv/
 .pytest_cache/
 experiments/log.json
+# trained / exported models are build artefacts: publish them as GitHub Release assets, not in git history
+models/custom/*.onnx
+data/osint_sources.json

@@ -1,0 +1,6 @@
+# Optional: LIVE Sentinel-2 verification through Microsoft Planetary Computer (free, no API key for reads).
+# Without these the app still works with the offline satellite simulator.
+-r requirements.txt
+pystac-client
+planetary-computer
+rasterio

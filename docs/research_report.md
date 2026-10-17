@@ -2,7 +2,7 @@
 ### A Research Prototype — Status Report and Methodology
 
 **Author:** Muhammad Saad
-**Status:** Working engineering prototype with a demo/baseline vision model and synthetic demonstration data. No hazard-specific model has been trained and no real Karachi observations have been collected — both are stated plainly wherever they matter, in this document and in the application itself.
+**Status:** Working engineering prototype (v2) with a demo/baseline vision model, an edge ONNX deployment path, a community-report (OSINT) pipeline, Sentinel-2 cross-verification, a multi-modal evidence-fusion risk matrix, and synthetic demonstration data. No hazard-specific model has been trained and no real Karachi observations have been collected — both are stated plainly wherever they matter, in this document and in the application itself.
 
 ---
 
@@ -38,7 +38,9 @@ Can low-cost smartphone imagery, combined with environmental, temporal, traffic,
 
 CAMERA → COMPUTER VISION (detection/classification) → TEMPORAL TRACKING (IoU-based, merges repeated frames/reports into single incidents) → GEOLOCATION (haversine clustering) → EVIDENCE FUSION (independent-source confidence, not frame count) → RISK ENGINE (configurable weighted components with stated reasons) → URBAN INTELLIGENCE (map, dossier, road-health index, flood/traffic labs).
 
-Implementation: Python, OpenCV, Ultralytics YOLO (swappable model registry), Streamlit, Plotly, SQLite, pytest. Full module layout in the README.
+Implementation: Python, OpenCV, ONNX Runtime (edge inference; Ultralytics only for training/export), Streamlit, Plotly, SQLite, pytest. Full module layout in the README.
+
+**v2 extension - multi-modal evidence.** Camera detections are no longer the only evidence stream. Public community reports (English / Roman Urdu / Urdu) are collected asynchronously and politely, analysed with a transparent lexicon, geocoded offline and de-duplicated (`scripts/osint_pipeline.py`). Reports of area-scale waterlogging trigger a Sentinel-2 check (NDWI/NDVI change against a dry-period baseline, cloud-masked; `geospatial/satellite.py`). The three streams are fused by `risk_engine/fusion.py` (capped, time-decayed noisy-OR over independent sources; explicit contradiction rule; 5x5 likelihood-by-impact matrix) and recorded in append-only SQLite tables with a hash-chained ledger. Specification: `docs/multimodal_fusion.md`.
 
 ## 8. Dataset
 
@@ -82,6 +84,9 @@ The tooling is built and unit-tested (`evaluate_with_conditions`, Section 13): g
 - Face-blur privacy step is best-effort Haar-cascade detection; license plates are not reliably anonymized.
 - Flood and traffic modules are scenario/estimation tools, not validated forecasts.
 - Evaluation tooling is real but has only been exercised against synthetic/unit-test data, not a genuine labelled Karachi set.
+- (v2) Community-report analysis is a lexicon, not a trained model; the gazetteer is approximate; satellite thresholds and fusion weights are expert-set and uncalibrated; the evidence-strength index is not a calibrated probability.
+- (v2) 10 m Sentinel-2 pixels cannot observe potholes, manholes or narrow street flooding, and clouds frequently block imagery during floods; these cases yield NOT_APPLICABLE / INCONCLUSIVE rather than negative evidence.
+- (v2) The risk matrix is tamper-evident (hash chain, append-only triggers, optional HMAC key), not tamper-proof.
 
 ## 17. Ethical Considerations
 
@@ -94,10 +99,14 @@ No face recognition, person identification, or license-plate identification is i
 3. Run the existing (already-built, already-tested) evaluation pipeline against a held-out, geographically-split test set.
 4. Calibrate traffic-density and flood-rainfall thresholds against any obtainable ground truth (even a small manual count).
 5. Extend the evidence-fusion model with real multi-user reports once the system has actual users.
+6. Calibrate the fusion weights, caps and half-lives, and the satellite thresholds, against a labelled set of confirmed/refuted reports and at least one verifiable Karachi flood event.
+7. Validate the live Sentinel-2 provider end to end; add Sentinel-1 SAR (sees through cloud) for flood verification.
+8. Train the hazard detector (pothole / open manhole / sewage overflow) on a consented, geotagged Karachi dataset, quantize it to INT8 with real calibration images, and report its measured accuracy.
+9. Replace the lexicon with a multilingual classifier only once a labelled Karachi text set exists to validate it.
 
 ## 19. Conclusion
 
-Karachi Pulse is an honestly-scoped engineering prototype: a complete, tested pipeline for detection, tracking, geospatial clustering, transparent risk scoring, and evaluation — built around real, documented problems in Karachi — that currently runs in demo mode because the two inputs that would make it "real" (a trained hazard model and real local data) require data-collection work this document does not pretend has happened.
+Karachi Pulse is an honestly-scoped engineering prototype: a complete, tested pipeline for detection (with an edge ONNX deployment path), tracking, geospatial clustering, community-report ingestion, satellite cross-verification, multi-modal evidence fusion, transparent risk scoring, and evaluation — built around real, documented problems in Karachi — that currently runs in demo mode because the two inputs that would make it "real" (a trained hazard model and real local data) require data-collection work this document does not pretend has happened.
 
 ## References
 

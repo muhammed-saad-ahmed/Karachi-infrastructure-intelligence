@@ -1,10 +1,12 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+# Karachi Pulse v2 - lightweight runtime (CPU only, no PyTorch, no inference server).
+# Python 3.10+ ; tested on 3.13.
 streamlit
-numpy<2
+numpy>=1.24
+pandas>=2.0
 opencv-python-headless
 Pillow
-pandas
+plotly>=5.24            # px.scatter_map needs plotly 5.24+
+onnxruntime>=1.17       # edge inference (YOLOv8-nano .onnx)
+beautifulsoup4          # OSINT HTML sources
+lxml
 scikit-learn
-ultralytics
-torch
-torchvision

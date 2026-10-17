@@ -1,0 +1,8 @@
+# Optional - only on the machine that TRAINS / EXPORTS / QUANTIZES the model (free Colab or Kaggle GPU).
+# Also enables the COCO baseline detector (yolov8n/s.pt) inside the app if you want it.
+--extra-index-url https://download.pytorch.org/whl/cpu
+-r requirements.txt
+ultralytics
+torch
+torchvision
+onnx

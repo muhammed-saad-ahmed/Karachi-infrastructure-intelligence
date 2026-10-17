@@ -9,7 +9,11 @@ from computer_vision.tracking import track
 from evaluation.metrics import evaluate_with_conditions, STANDARD_CONDITIONS
 from scripts.generate_demo_data import make
 from prediction.hotspots import recurring_hotspots, MIN_OBSERVATIONS_FOR_PREDICTION
-from database.db import connect as db_connect, insert_observation, insert_detection, fetch_observations, fetch_detections
+from database.db import (connect as db_connect, insert_observation, insert_detection, fetch_observations,
+                         fetch_detections, fetch_risk_matrix)
+from risk_engine import fusion
+from app_ui.fusion_pages import (render_risk_matrix, render_osint_feed, render_satellite_check,
+                                  render_edge_panel)
 from app_ui.theme import inject_global_css, risk_color, TEXT, TEXT_MUTED, TEXT_FAINT, ACCENT, VERSION
 from app_ui.components import (metric_tile, confidence_bar, section_header, hero, radial_gauge,
                                 pipeline_diagram, empty_state, error_state, footer, privacy_badge,
@@ -23,6 +27,7 @@ NAV_GROUPS = {
     "OVERVIEW": ["Command Center"],
     "ANALYZE": ["AI Analysis Lab"],
     "INTELLIGENCE": ["Intelligence Map", "Incidents", "Road Health", "Flood Lab", "Traffic Lab"],
+    "FUSION": ["Risk Matrix", "OSINT Feed", "Satellite Check"],
     "DATA": ["Analytics", "Data Explorer"],
     "RESEARCH": ["Model Lab", "Research", "About"],
 }
@@ -47,6 +52,14 @@ def get_cached_detector(weights=DEFAULT_BASELINE):
 @st.cache_resource
 def get_db():
     return db_connect(config.DB_PATH)
+
+
+def refresh_fusion():
+    """Re-fuses all evidence after new geotagged detections are saved. Never lets a fusion problem break an upload."""
+    try:
+        fusion.assess_all(get_db())
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Risk matrix not refreshed: {type(exc).__name__}: {exc}")
 
 
 @st.cache_data
@@ -118,7 +131,10 @@ if page == "Command Center":
     with c2: metric_tile("Active incidents", f"{len(df):,}")
     with c3: metric_tile("High + critical risk", f"{(df.level.isin(['High', 'Critical'])).sum():,}",
                           accent=risk_color("High"))
-    with c4: metric_tile("Areas monitored", "1 (synthetic bbox)")
+    with c4:
+        _rm = fetch_risk_matrix(get_db())
+        metric_tile("Fused hazard cells", f"{len(_rm):,}",
+                    delta="from Risk Matrix" if len(_rm) else "run the demo on Risk Matrix")
 
     st.write("")
     cL, cR = st.columns([2, 1])
@@ -134,6 +150,8 @@ if page == "Command Center":
             go_to("AI Analysis Lab")
         if st.button("EXPLORE KARACHI", width="stretch"):
             go_to("Intelligence Map")
+        if st.button("OPEN RISK MATRIX", width="stretch"):
+            go_to("Risk Matrix")
         st.markdown('<div class="kp-card" style="margin-top:0.6rem">'
                     '<div style="font-weight:700;margin-bottom:0.3rem">Research question</div>'
                     f'<div style="color:{TEXT_MUTED};font-size:0.86rem;line-height:1.5">Can low-cost smartphone '
@@ -148,7 +166,7 @@ elif page == "AI Analysis Lab":
     privacy_badge()
     st.caption("Detections from this page are saved to the local SQLite database "
                f"(`{config.DB_PATH}`) as real, non-synthetic observations — view them in Data Explorer. "
-               "Nothing leaves your machine.")
+               "Hazard detections with coordinates also feed the fused Risk Matrix. Nothing leaves your machine.")
     st.write("")
     files = st.file_uploader("Drop an image or video, or select from device",
                               type=["jpg", "jpeg", "png", "mp4", "avi", "mov"], accept_multiple_files=True)
@@ -158,8 +176,8 @@ elif page == "AI Analysis Lab":
                  "Analysis will continue without blurring — see Research page for details.")
 
     active_det = det
-    if det.name == "yolo-custom":
-        st.caption("Custom Karachi-trained model detected — this is used automatically; the baseline selector below is hidden.")
+    if dt.is_custom(det):
+        st.caption("Custom Karachi-trained model detected (" + det.name + ") — this is used automatically; the baseline selector below is hidden.")
     else:
         chosen = st.selectbox("Baseline detector", list(BASELINE_CHOICES), index=list(BASELINE_CHOICES).index(
                                st.session_state.get("baseline_weights", DEFAULT_BASELINE)),
@@ -230,6 +248,8 @@ elif page == "AI Analysis Lab":
                                                      is_synthetic=False, processing_version=config.PROCESSING_VERSION)
                         for t_ in tr:
                             insert_detection(db, obs_id, t_["label"], sum(t_["confs"]) / len(t_["confs"]), None)
+                        if _parse_coord(lat) is not None and _parse_coord(lon) is not None:
+                            refresh_fusion()
                     continue
 
                 img = pp.decode_image(data)
@@ -281,6 +301,8 @@ elif page == "AI Analysis Lab":
                                              is_synthetic=False, processing_version=config.PROCESSING_VERSION)
                 for d in r["detections"]:
                     insert_detection(db, obs_id, d["label"], d["confidence"], d["bbox"])
+                if r["detections"] and _parse_coord(lat) is not None and _parse_coord(lon) is not None:
+                    refresh_fusion()
             except pp.InvalidInput as e:
                 error_state(f"{f.name} could not be read as a valid image or video.", e)
             except Exception as e:
@@ -595,6 +617,19 @@ elif page == "Data Explorer":
             st.dataframe(real_dets, width="stretch")
     footer()
 
+# ================================================================ FUSION PAGES
+elif page == "Risk Matrix":
+    render_risk_matrix(get_db())
+    footer()
+
+elif page == "OSINT Feed":
+    render_osint_feed(get_db())
+    footer()
+
+elif page == "Satellite Check":
+    render_satellite_check(get_db())
+    footer()
+
 elif page == "Model Lab":
     section_header("AI RESEARCH ENVIRONMENT", "Model Lab")
     c1, c2, c3 = st.columns(3)
@@ -602,7 +637,7 @@ elif page == "Model Lab":
     with c2: metric_tile("Weights", det.version)
     with c3: metric_tile("Scope", det.scope)
     st.write("")
-    if det.name == "yolo-custom":
+    if dt.is_custom(det):
         st.info("A custom model was found in models/custom/. Its class list and benchmark below reflect that model.")
 
     names = dt.class_names(det)
@@ -623,6 +658,8 @@ elif page == "Model Lab":
             with b2: metric_tile("Median latency", f"{bench['median_ms']} ms")
             with b3: metric_tile("Min / Max", f"{bench['min_ms']} / {bench['max_ms']} ms")
             with b4: metric_tile("Throughput", f"{bench['fps']} FPS")
+
+    render_edge_panel(det)
 
     st.markdown('<div class="kp-eyebrow" style="margin-top:0.8rem">EVALUATE AGAINST YOUR OWN LABELLED IMAGES</div>', unsafe_allow_html=True)
     st.caption("Upload images plus a ground-truth JSON and this computes REAL precision/recall/F1 — not a placeholder. "
@@ -717,6 +754,18 @@ elif page == "Research":
         st.write("Haversine-distance clustering merges same-type observations into single incidents (geospatial/clustering.py).")
     with st.expander("Evaluation"):
         st.write("Precision/Recall/F1/IoU-matching and MAE/RMSE utilities (evaluation/metrics.py), unit-tested; require a labelled dataset to produce real numbers.")
+    with st.expander("Edge runtime (ONNX)"):
+        st.write("YOLOv8-nano exported to ONNX and run with onnxruntime on CPU - no PyTorch, no server (computer_vision/edge_onnx.py). "
+                 "INT8 quantization needs real calibration images and must be validated; no trained hazard weights ship with the repo.")
+    with st.expander("OSINT pipeline"):
+        st.write("Async, polite (robots.txt, rate limits, backoff) collection of public civic-hazard reports; lexicon-based English/"
+                 "Roman-Urdu/Urdu analysis; offline gazetteer geocoding; author hashing; near-duplicate suppression (scripts/osint_pipeline.py).")
+    with st.expander("Satellite verification"):
+        st.write("Sentinel-2 L2A via Microsoft Planetary Computer: NDWI/NDVI change against a dry-period baseline, SCL cloud masking, "
+                 "explicit INCONCLUSIVE / NOT_APPLICABLE verdicts (geospatial/satellite.py).")
+    with st.expander("Evidence fusion & tamper-evidence"):
+        st.write("Capped, time-decayed noisy-OR across independent sources and modalities -> 5x5 likelihood x impact matrix, recorded in a "
+                 "hash-chained append-only ledger (risk_engine/fusion.py, database/db.py). Tamper-EVIDENT, not tamper-proof.")
     with st.expander("Limitations"):
         st.markdown("**Limitations." + methodology.split("**Limitations.**")[-1])
     with st.expander("Future work"):
