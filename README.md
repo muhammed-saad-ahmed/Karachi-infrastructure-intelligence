@@ -5,7 +5,7 @@
 > *Not an official municipal system, safety rating, government service, or production-ready hazard detection system.*
 
 **Author:** Muhammad Saad
-**Version:** 2.0.0 (multi-modal edition)
+**Version:** 2.1.0 (multi-modal edition, hardened)
 **License:** MIT
 
 ---
@@ -50,17 +50,22 @@ YOLOv8-nano → ONNX → ONNX Runtime on CPU. Aspect-preserving letterbox, singl
 **Limitation:** no trained pothole / open-manhole / sewage weights ship with this repository — that needs a properly collected, consented, geotagged, labelled dataset. The module is the deployment path for the weights you train.
 
 ### 2. OSINT pipeline (`scripts/osint_pipeline.py`, `scripts/osint_text.py`, `geospatial/gazetteer.py`)
-Asynchronous, polite collection (robots.txt incl. Crawl-delay, per-host rate limit, retries with exponential backoff + jitter, circuit breaker, size caps) of RSS/Atom and CSS-selector HTML sources (optional Playwright for JavaScript pages). A deterministic **mock stream** simulates a rate-limited public feed so everything runs offline. Posts get transparent lexicon-based hazard/urgency/sentiment scores, offline geocoding (explicit coordinates, map links, or a Karachi neighbourhood gazetteer with an explicit uncertainty radius), salted author pseudonyms, redaction of emails/phones/@mentions, and near-duplicate suppression so a viral copy-paste cannot fake corroboration.
+Asynchronous, polite collection (robots.txt incl. Crawl-delay, per-host rate limit, retries with exponential backoff + jitter, circuit breaker, size caps) of RSS/Atom and CSS-selector HTML sources (optional Playwright for JavaScript pages). A deterministic **mock stream** simulates a rate-limited public feed so everything runs offline. Posts get **embedding-based** hazard/urgency/sentiment scores (ONNX multilingual sentence encoder when installed, dependency-free n-gram fallback otherwise) with a negation / intensity / sarcasm parser for English and Roman Urdu, offline geocoding (explicit coordinates, map links, or a Karachi neighbourhood gazetteer with an explicit uncertainty radius), salted author pseudonyms, redaction of emails/phones/@mentions, and near-duplicate suppression so a viral copy-paste cannot fake corroboration.
 
-**Limitations:** the text analysis is a lexicon, not a trained model (sarcasm, long-range negation and Roman-Urdu spelling variants fool it); gazetteer coordinates are approximate. **Scrape only what you are allowed to** — most social networks forbid it in their terms; prefer RSS, official complaint portals and open data.
+**Limitations:** the bundled fallback embedder is orthographic, not semantic (install the ONNX encoder for real cross-lingual matching, see `docs/multimodal_fusion.md` section 6.3); sarcasm and long-range negation still fool it; thresholds are untuned on real Karachi text; gazetteer coordinates are approximate. **Scrape only what you are allowed to** — most social networks forbid it in their terms; prefer RSS, official complaint portals and open data.
 
 ### 3. Satellite fusion (`geospatial/satellite.py`)
-For a strong, located report of area-scale waterlogging, fetch the clear Sentinel-2 L2A scene nearest the report and a median composite of clear dry-period scenes, mask clouds with the SCL band, compute **NDWI** (McFeeters 1996), **MNDWI** (Xu 2006) and **NDVI** (Tucker 1979), and count *newly wet, non-vegetated* pixels (speckle removed). Four explicit verdicts: `CONFIRMED_WET`, `NO_CHANGE`, `INCONCLUSIVE` (clouds / no scene / provider error), `NOT_APPLICABLE` (potholes and manholes are smaller than a 10 m pixel). Results are cached per ~550 m cell to be kind to the free API, and every result carries a digest.
+For a strong, located report of area-scale waterlogging, fetch the clear Sentinel-2 L2A scene nearest the report and a median composite of clear dry-period scenes, mask clouds with the SCL band, compute **NDWI** (McFeeters 1996), **MNDWI** (Xu 2006) and **NDVI** (Tucker 1979), and unmix each pixel into water / vegetation / impervious / shade fractions (**fully constrained linear spectral mixture analysis**) and count *newly wet* pixels after a **structural shadow mask** removes thin dark strips beside bright roofs (the classic false 'water' in dense cities); the NDWI method remains available with `KP_SAT_METHOD=ndwi`. Four explicit verdicts: `CONFIRMED_WET`, `NO_CHANGE`, `INCONCLUSIVE` (clouds / no scene / provider error), `NOT_APPLICABLE` (potholes and manholes are smaller than a 10 m pixel). Results are cached per ~550 m cell to be kind to the free API, and every result carries a digest.
 
 **Limitations:** a 10 m pixel cannot see narrow street flooding; floods come with clouds; revisit takes days; thresholds are expert-set, not calibrated. The live provider needs network access and the optional packages in `requirements-satellite.txt`; an offline, clearly-labelled synthetic provider is used for tests and demos.
 
 ### 4. Multi-modal evidence fusion (`risk_engine/fusion.py`)
 Capped, time-decayed **noisy-OR over independent sources** (one image / one author counts once), then across modalities; an explicit, bounded contradiction rule when clear satellite imagery of an observable hazard shows no change; impact computed only from *known* components (unknowns are dropped and flagged, never guessed). The output is a 5×5 likelihood × impact matrix with per-modality strengths, leave-one-out marginal contributions, flags, a plain-text explanation generated from the numbers, and an input digest + configuration fingerprint. Stored in append-only SQLite tables and recorded in a hash-chained ledger (optionally HMAC-keyed). **Tamper-evident, not tamper-proof** — see `docs/multimodal_fusion.md` for exactly what is and is not guaranteed.
+
+### 4b. Robustness, calibration and privacy (v2.1)
+* **Sensitivity (`evaluation/simulation.py`, *Sensitivity* page):** 10,000-draw Monte-Carlo perturbation of every fusion parameter -> 95% intervals for each cell's likelihood/impact/risk, category stability, a variance-tolerance ladder and a leave-one-out matrix (CV vs OSINT vs satellite). An optional Metropolis calibration of source reliability needs real field-checked labels.
+* **INT8 pipeline (`scripts/dataset_formatter.py`):** Karachi-lighting augmentation -> 50-image calibration set -> static INT8 -> raw-tensor agreement (cosine, relative L2, SQNR, top-k overlap), latency and pass/fail gates asserted in pytest.
+* **Location privacy (`geospatial/gazetteer.py`, `database/db.py`, *Location Privacy* page):** planar-Laplace geo-indistinguishability on exact report coordinates (mean displacement ~144 m, hard cap 666 m), sticky per-author noise, uncertainty-aware grouping. Perfect clustering under local differential privacy is impossible; the trade-off is documented.
 
 ### 5. Original platform (v1, unchanged)
 Detection registry, IoU tracking, haversine clustering, the original transparent risk engine, Flood Lab, Traffic Lab, condition-wise error-analysis evaluation, dataset tooling (validation, perceptual-hash duplicates, **geographic** train/val/test split), experiment tracking and the recurring-hotspot rule.
@@ -138,6 +143,13 @@ python -m computer_vision.edge_onnx compare  --fp32 models/custom/hazard_n.onnx 
 python -m computer_vision.edge_onnx bench    --model models/custom/hazard_n.onnx
 python -m computer_vision.edge_onnx infer    --model models/custom/hazard_n.onnx --image road.jpg
 
+# INT8 calibration set + FP32-vs-INT8 verification
+python -m scripts.dataset_formatter build --src data/raw --out data/calib --n 50
+python -m scripts.dataset_formatter int8  --model models/custom/hazard_n.onnx --src data/raw --work reports/int8
+
+# Monte-Carlo sensitivity of the fused matrix (10,000 draws)
+python -m evaluation.simulation --synthetic 60 --n-iter 10000 --out reports/sensitivity.md --anchor
+
 # OSINT
 python -m scripts.osint_pipeline --mock 60 --satellite synthetic          # offline
 cp data/osint_sources.example.json data/osint_sources.json                 # edit with sources you are allowed to read
@@ -173,7 +185,7 @@ karachi-pulse/
 ├── app_ui/                       Design system + reusable UI components
 │   ├── theme.py                  Color tokens, typography, global CSS
 │   ├── components.py             Cards, gauges, dossiers, detection rendering
-│   └── fusion_pages.py           Risk Matrix, OSINT Feed, Satellite Check, Edge panel
+│   └── fusion_pages.py           Risk Matrix, OSINT Feed, Satellite Check, Sensitivity, Privacy, Edge panel
 │
 ├── computer_vision/
 │   ├── preprocessing.py          Validation, decode, face blur, frame sampling
@@ -191,14 +203,15 @@ karachi-pulse/
 │
 ├── geospatial/
 │   ├── clustering.py             Haversine clustering, coordinate validation
-│   ├── gazetteer.py              Offline Karachi geocoder (coordinates / neighbourhood names)
-│   └── satellite.py              Sentinel-2 NDWI/NDVI cross-verification, providers, caching
+│   ├── gazetteer.py              Offline Karachi geocoder + planar-Laplace location privacy
+│   └── satellite.py              Sentinel-2 LSMA unmixing, shadow mask, NDWI fallback, providers, caching
 │
 ├── database/
 │   └── db.py                     SQLite schema, helpers, append-only triggers, hash-chained ledger
 │
 ├── evaluation/
-│   └── metrics.py                Precision/Recall/F1, IoU matching, condition-wise error analysis
+│   ├── metrics.py                Precision/Recall/F1, IoU matching, condition-wise error analysis
+│   └── simulation.py             Monte-Carlo sensitivity, leave-one-out matrix, Metropolis calibration
 │
 ├── prediction/
 │   └── hotspots.py               Recurring-hotspot flagging (recurrence rule)
@@ -210,7 +223,8 @@ karachi-pulse/
 │   ├── generate_demo_data.py     Synthetic demo data + offline multi-modal demo seeder
 │   ├── dataset_tools.py          Validation, duplicate detection, geographic split, stats
 │   ├── osint_pipeline.py         Async polite scraper, parsers, mock stream, pipeline, CLI
-│   ├── osint_text.py             Lexicon analysis (EN / Roman Urdu / Urdu), redaction, dedup
+│   ├── osint_text.py             Semantic text analysis (ONNX encoder / n-gram fallback), negation, sarcasm, redaction, dedup
+│   ├── dataset_formatter.py      Lighting augmentation, 50-image INT8 calibration set, INT8-vs-FP32 gates
 │   └── train_edge_model.py       Train -> export -> quantize on free Colab/Kaggle
 │
 ├── models/
@@ -231,6 +245,8 @@ karachi-pulse/
 └── tests/
     ├── test_core.py              31 original unit tests
     ├── test_v2.py                55 tests: ONNX runtime, OSINT, satellite, fusion, ledger tamper detection
+    ├── test_v3.py                LSMA/shadow, Monte-Carlo + Metropolis, semantic text, location privacy
+    ├── test_int8_pipeline.py     augmentation, calibration set, tensor agreement, latency, INT8 gates
     └── tiny_onnx.py              Builds a stub ONNX model (no `onnx` package needed) for runtime tests
 ```
 
@@ -273,7 +289,7 @@ list_experiments()
 ## Privacy, Ethics and Responsible Use
 
 * No face recognition, person identification or license-plate identification is implemented or planned; faces are blurred before analysis (best-effort).
-* OSINT: public pages only, robots.txt honoured, rate-limited, identifiable User-Agent; author handles salted-hashed (set `KP_PRIVACY_SALT`), emails/phones/@mentions removed, images not downloaded. Reports describe places, not people.
+* OSINT: public pages only, robots.txt honoured, rate-limited, identifiable User-Agent; author handles salted-hashed (set `KP_PRIVACY_SALT`), emails/phones/@mentions removed, **exact coordinates displaced by local differential privacy and scrubbed from stored text** (see `docs/multimodal_fusion.md` 6.5), images not downloaded. Reports describe places, not people.
 * Respect each source's terms of service. This tool must not be pointed at platforms that prohibit scraping.
 * Risk scores are experimental and **not** an official safety rating. Do not use them for emergency decisions.
 

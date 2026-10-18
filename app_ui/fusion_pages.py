@@ -248,9 +248,10 @@ def render_osint_feed(conn):
 def render_satellite_check(conn):
     section_header("SENTINEL-2 CROSS-VERIFICATION", "Satellite Check",
                    "Does Sentinel-2 show new water or surface change where a report says there is flooding?")
-    st.caption("NDWI = (Green - NIR)/(Green + NIR) finds water; NDVI = (NIR - Red)/(NIR + Red) rules out vegetation; "
-               "a pixel counts as newly wet only if it became water relative to a dry-period median composite and is "
-               "not vegetated. 10 m pixels cannot see potholes, manholes or narrow street flooding - those return "
+    st.caption("Default method: linear spectral mixture analysis (LSMA). Each 10 m pixel is unmixed into water / "
+               "vegetation / impervious / shade fractions (non-negative, summing to 1); a pixel counts as newly wet only "
+               "if its WATER fraction rose against a dry-period median composite. A structural shadow mask removes thin, "
+               "dark strips beside bright roofs, which otherwise look like water. (NDWI/NDVI remain as the fallback method.) 10 m pixels cannot see potholes, manholes or narrow street flooding - those return "
                "NOT_APPLICABLE or a limited 'no change', never proof of absence. Clouds give INCONCLUSIVE, not 'dry'.")
     c = st.columns([1, 1, 1.2])
     lat = c[0].number_input("Latitude", value=24.9215, format="%.5f", min_value=24.0, max_value=26.0)
@@ -297,6 +298,21 @@ def _render_evidence(ev):
                               margin=dict(l=0, r=0, t=30, b=0), height=240, paper_bgcolor="rgba(0,0,0,0)", font_color=TEXT)
             fig.update_xaxes(visible=False); fig.update_yaxes(visible=False)
             col_.plotly_chart(fig, width="stretch")
+    if pv and "water_abundance_event" in pv:
+        g2 = st.columns(2)
+        for col_, key, title, scale in ((g2[0], "water_abundance_event", "Water fraction, event scene (LSMA)", "Blues"),
+                                        (g2[1], "shadow", "Building / cloud shadow mask", "Greys")):
+            arr = np.asarray(pv[key]).astype(float)
+            fig = px.imshow(arr, color_continuous_scale=scale, zmin=0, zmax=1, aspect="equal")
+            fig.update_layout(coloraxis_showscale=False, title=dict(text=title, font=dict(size=12)),
+                              margin=dict(l=0, r=0, t=30, b=0), height=240, paper_bgcolor="rgba(0,0,0,0)", font_color=TEXT)
+            fig.update_xaxes(visible=False); fig.update_yaxes(visible=False)
+            col_.plotly_chart(fig, width="stretch")
+    d = ev.to_dict() if hasattr(ev, "to_dict") else {}
+    stats = {k: d.get(k) for k in ("method", "shadow_filter", "shadow_false_positive_px", "naive_ndwi_gain_frac",
+                                   "water_equiv_gain_frac", "fit_rmse_event_mean", "poor_fit_fraction") if k in d}
+    if stats:
+        st.caption("Method details: " + ", ".join(f"{k} = {v}" for k, v in stats.items()))
     with st.expander("All measured values"):
         st.json(ev.to_dict())
 
@@ -329,3 +345,74 @@ def render_edge_panel(det):
             with c[3]: metric_tile("Model size", f"{b['size_mb']} MB")
             with c[4]: metric_tile("Threads", str(b["threads"]))
             st.caption("Measured on THIS machine with a noise image (speed only, not accuracy). Re-run on the target device.")
+
+
+# ====================================================================== Monte-Carlo sensitivity
+def render_sensitivity(conn):
+    """Monte-Carlo robustness of the fused risk matrix: how much do the 5x5 categories move when the expert-set
+    parameters are perturbed? Also leave-one-out (CV vs OSINT vs satellite)."""
+    from evaluation import simulation as sim
+    section_header("ROBUSTNESS", "Sensitivity & Stability",
+                   "Gaussian perturbation of the fusion weights, 10,000 draws by default, with 95% credible bands.")
+    st.caption("This measures how DEPENDENT the output is on parameters nobody has validated - it is not accuracy. "
+               "A cell whose category flips under small perturbations is a cell to treat with caution. "
+               "Calibrating the weights needs labelled field checks (see docs/multimodal_fusion.md).")
+    c = st.columns(4)
+    n_iter = int(c[0].number_input("Iterations", min_value=500, max_value=50_000, value=10_000, step=500))
+    sigma = float(c[1].slider("Relative perturbation (sd)", 0.02, 0.5, 0.15, 0.01))
+    use_syn = c[2].checkbox("Use synthetic demo cells", value=False)
+    n_syn = int(c[3].number_input("Synthetic cells", min_value=10, max_value=300, value=60, step=10)) if use_syn else 0
+    if not st.button("Run simulation", type="primary"):
+        return
+    try:
+        if use_syn:
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
+            cells, evs = sim.synthetic_cells(n_syn, seed=1, now=now)
+            comp = sim.compile_cells(cells, evs, now=now)
+            st.warning("These cells are SYNTHETIC. Results demonstrate the method only.")
+        else:
+            comp = sim.load_cells(conn)
+        if comp.n_cells == 0:
+            empty_state("No fused cells yet", "Run the OSINT pipeline first, or tick the synthetic option.")
+            return
+        with st.spinner(f"{n_iter:,} draws over {comp.n_cells} cells..."):
+            rep = sim.run_sensitivity(comp, sim.SimulationSettings(n_iter=n_iter, sigma=sigma))
+    except Exception as exc:                     # never take the app down for an analysis page
+        error_state("Simulation failed", str(exc))
+        return
+    s_ = rep["stability"]
+    k = st.columns(4)
+    with k[0]: metric_tile("Category stability", f"{s_['overall_category_stability']:.0%}")
+    with k[1]: metric_tile("Mean 95% CI width (E)", f"{s_['mean_E_ci_width']:.2f}")
+    with k[2]: metric_tile("Tolerance sd", "below ladder" if s_.get("tolerance_below_ladder") else str(s_["tolerance_sigma"]))
+    with k[3]: metric_tile("Severe-shock stability", f"{rep['loo']['severe_overall_category_stability']:.0%}")
+    tabs = sim.report_tables(rep)
+    for name, frame in tabs.items():
+        st.markdown(f'<div class="kp-eyebrow" style="margin-top:0.8rem">{name.upper().replace("_", " ")}</div>', unsafe_allow_html=True)
+        st.dataframe(frame, width="stretch", height=260)
+    st.download_button("Download report (Markdown)", sim.markdown_report(rep), file_name="sensitivity_report.md")
+    if st.button("Anchor report digest in the ledger"):
+        sim.anchor_report(conn, rep)
+        st.success("Digest appended to the hash-chained ledger.")
+
+
+# ====================================================================== location privacy
+def render_privacy_panel():
+    """Explains and demonstrates the local differential privacy applied to precise report coordinates."""
+    from geospatial import gazetteer as gz
+    section_header("LOCATION PRIVACY", "Differential Privacy on Coordinates",
+                   "Planar-Laplace geo-indistinguishability applied once, at ingestion.")
+    g = gz.GeoPrivacy.from_config()
+    d = g.describe()
+    k = st.columns(4)
+    with k[0]: metric_tile("Status", "ON" if config.PRIVACY_LDP_ENABLED else "OFF")
+    with k[1]: metric_tile("Mean displacement", f"{d['expected_displacement_m']:.0f} m")
+    with k[2]: metric_tile("95% within", f"{d['r95_m']:.0f} m")
+    with k[3]: metric_tile("Hard cap", f"{d['cap_radius_m']:.0f} m")
+    st.caption("Exact coordinates (typed in a post, a map link, or supplied by the source) are displaced by random noise "
+               "before they are stored; the stored uncertainty radius grows to match, so fusion down-weights these "
+               "reports and still groups neighbours together. Neighbourhood-level gazetteer locations are not noised. "
+               "The same author reporting from the same ~55 m spot always gets the same noise, so repeating a report "
+               "cannot average the noise away. Clusters of several reports stay usable; a single report is only "
+               "locatable to a few hundred metres - that is the privacy/utility trade-off. Set KP_LDP=0 to disable.")

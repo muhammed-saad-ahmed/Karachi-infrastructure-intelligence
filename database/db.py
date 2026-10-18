@@ -230,10 +230,32 @@ _OSINT_COLS = ("platform", "post_id", "url", "author_hash", "posted_at", "scrape
                "content_sha256", "duplicate_of", "is_synthetic")
 
 
+def _enforce_location_privacy(row):
+    """Last line of defence at the storage boundary: whatever the caller did, a PRECISE coordinate (geo_method
+    'explicit' or 'source') is never written as-is. It is privatised here (planar-Laplace noise, see
+    geospatial/gazetteer.py), and exact coordinates are scrubbed from the text and URL. Already-private rows
+    (method ending '+ldp') and neighbourhood-level gazetteer rows pass through untouched, so this is idempotent.
+    Schema is unchanged: the applied state is recorded in geo_method ('explicit+ldp')."""
+    from geospatial import gazetteer
+    row["text"] = gazetteer.redact_coordinates(row.get("text") or "")
+    if row.get("url"):
+        row["url"] = gazetteer.redact_coordinates(row["url"])
+    if row.get("lat") is not None and row.get("geo_method") in config.PRIVACY_PRECISE_METHODS:
+        g = gazetteer.privatize_location(
+            {"lat": row["lat"], "lon": row["lon"], "radius_m": row.get("geo_radius_m") or 30.0,
+             "method": row["geo_method"], "place": row.get("geo_place")},
+            author_hash=row.get("author_hash"), is_synthetic=bool(row.get("is_synthetic")))
+        if g is None:                       # unusable coordinate: drop it rather than store it unprotected
+            row.update(lat=None, lon=None, geo_method=None, geo_radius_m=None)
+        else:
+            row.update(lat=g["lat"], lon=g["lon"], geo_radius_m=g["radius_m"], geo_method=g["method"])
+
+
 def insert_osint_post(conn, **fields):
     """Inserts one processed post. Returns the new row id, or None if (platform, post_id) already exists
     (re-scraping the same page must be idempotent)."""
     row = {c: fields.get(c) for c in _OSINT_COLS}
+    _enforce_location_privacy(row)
     for jf in ("image_urls", "keywords"):
         if isinstance(row[jf], (list, tuple)):
             row[jf] = json.dumps(list(row[jf]), ensure_ascii=False)

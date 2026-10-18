@@ -22,7 +22,7 @@ ACCENT_DIM = "#1B8AA3"
 RISK_COLORS = {"Low": "#3AA76D", "Moderate": "#E8C547", "High": "#E8842C", "Critical": "#E14B4B",
                "Medium": "#E8842C"}
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 
 def risk_color(level: str) -> str:

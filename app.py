@@ -13,7 +13,7 @@ from database.db import (connect as db_connect, insert_observation, insert_detec
                          fetch_detections, fetch_risk_matrix)
 from risk_engine import fusion
 from app_ui.fusion_pages import (render_risk_matrix, render_osint_feed, render_satellite_check,
-                                  render_edge_panel)
+                                  render_edge_panel, render_sensitivity, render_privacy_panel)
 from app_ui.theme import inject_global_css, risk_color, TEXT, TEXT_MUTED, TEXT_FAINT, ACCENT, VERSION
 from app_ui.components import (metric_tile, confidence_bar, section_header, hero, radial_gauge,
                                 pipeline_diagram, empty_state, error_state, footer, privacy_badge,
@@ -27,7 +27,7 @@ NAV_GROUPS = {
     "OVERVIEW": ["Command Center"],
     "ANALYZE": ["AI Analysis Lab"],
     "INTELLIGENCE": ["Intelligence Map", "Incidents", "Road Health", "Flood Lab", "Traffic Lab"],
-    "FUSION": ["Risk Matrix", "OSINT Feed", "Satellite Check"],
+    "FUSION": ["Risk Matrix", "OSINT Feed", "Satellite Check", "Sensitivity", "Location Privacy"],
     "DATA": ["Analytics", "Data Explorer"],
     "RESEARCH": ["Model Lab", "Research", "About"],
 }
@@ -628,6 +628,14 @@ elif page == "OSINT Feed":
 
 elif page == "Satellite Check":
     render_satellite_check(get_db())
+    footer()
+
+elif page == "Sensitivity":
+    render_sensitivity(get_db())
+    footer()
+
+elif page == "Location Privacy":
+    render_privacy_panel()
     footer()
 
 elif page == "Model Lab":

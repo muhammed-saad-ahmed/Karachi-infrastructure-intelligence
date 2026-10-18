@@ -1,0 +1,4 @@
+# Optional: multilingual sentence encoder for scripts/osint_text.py (true cross-lingual semantics).
+# Without these the dependency-free hashed n-gram fallback is used.
+-r requirements.txt
+tokenizers

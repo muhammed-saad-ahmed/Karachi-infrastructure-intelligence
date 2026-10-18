@@ -147,8 +147,12 @@ def baseline_depth_factor(n_scenes):
     return {0: 0.0, 1: 0.8, 2: 0.9}.get(int(n_scenes), 1.0)
 
 
-def _masked_index(scene, which):
+def _masked_index(scene, which, extra_invalid=None):
+    """Index array with NaN wherever the pixel is not trustworthy (SCL cloud/shadow classes, plus an optional
+    extra mask such as the structural building-shadow mask). Returns (index, valid)."""
     valid = valid_mask_from_scl(scene["scl"])
+    if extra_invalid is not None:
+        valid = valid & ~np.asarray(extra_invalid, dtype=bool)
     if which == "ndwi":
         idx = ndwi(scene["green"], scene["nir"])
     elif which == "ndvi":
@@ -170,53 +174,273 @@ def _r(x, nd=4):
     return None if x is None or (isinstance(x, float) and not math.isfinite(x)) else round(float(x), nd)
 
 
-def compute_change_metrics(event, baselines, *, thr=None, min_delta=None, max_ndvi_water=None,
-                           min_cluster_px=None):
-    """Compares one event scene against the median of the baseline scenes.
+# ====================================================================== sub-pixel unmixing (LSMA)
+BAND_NAMES = ("green", "red", "nir", "swir")      # B03, B04, B08, B11
 
-    event / each baseline: dict with float32 reflectance arrays 'green','red','nir' (+ optional 'swir')
-    and a uint8 'scl' array, all the same shape (a scene dict as returned by SceneProvider.read()).
 
-    A pixel counts as NEWLY WET only if ALL hold:
-        event NDWI > thr  AND  baseline NDWI <= thr  AND  (event NDWI - baseline NDWI) >= min_delta
-        AND event NDVI <= max_ndvi_water   (looks like water, not like vegetation)
-        AND the pixel is clear (SCL) in the event scene and in at least one baseline scene.
-    Returns (metrics: dict of plain floats, preview: dict of arrays for plotting).
+def endmember_matrix(spec=None):
+    """-> (E, names). E has shape (n_bands, n_endmembers); column j is the spectrum of names[j].
+    Raises ValueError for spectra that are negative, non-finite, wrong length or linearly dependent
+    (unmixing would then be ill-posed)."""
+    spec = config.SAT_ENDMEMBERS if spec is None else spec
+    names = tuple(spec)
+    if len(names) < 2:
+        raise ValueError("need at least two endmembers")
+    try:
+        E = np.array([spec[n] for n in names], dtype=np.float64).T
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"endmember spectra must be equal-length numeric tuples: {exc}") from exc
+    if E.ndim != 2 or E.shape[0] != len(BAND_NAMES):
+        raise ValueError(f"each endmember needs {len(BAND_NAMES)} values (bands {BAND_NAMES})")
+    if not np.isfinite(E).all() or (E < 0).any():
+        raise ValueError("endmember reflectances must be finite and non-negative")
+    if np.linalg.matrix_rank(E) < E.shape[1]:
+        raise ValueError("endmember spectra are linearly dependent; abundances would not be unique")
+    return E, names
+
+
+def fcls_unmix(pixels, endmembers):
+    """Fully Constrained Least Squares linear spectral unmixing:  min ||x - E a||^2  s.t.  a >= 0, sum(a) = 1.
+
+    pixels      (n, n_bands) reflectance; rows containing NaN come back as NaN.
+    endmembers  (n_bands, m) spectra as columns.
+    Returns (abundances (n, m), rmse (n,)) with rmse = sqrt(mean squared residual per band).
+
+    Exact and fully vectorised: the optimum of this convex problem has some support set S (the endmembers with
+    non-zero abundance). For each of the 2^m - 1 candidate supports we solve the sum-to-one equality-constrained
+    least-squares problem in closed form (Lagrange multiplier), keep the candidates whose solution is
+    non-negative, and take the one with the smallest residual. For the m = 4 used here that is 15 small matrix
+    products for the whole image - no per-pixel loops, no iterative solver, and no tolerance to tune.
+    (Heinz & Chang 2001 give the iterative NNLS-based FCLS; this enumeration reaches the same optimum.)
+    """
+    X = np.atleast_2d(np.asarray(pixels, dtype=np.float64))
+    E = np.asarray(endmembers, dtype=np.float64)
+    if X.ndim != 2 or E.ndim != 2 or E.shape[0] != X.shape[1]:
+        raise ValueError(f"pixels {X.shape} and endmembers {E.shape} are not compatible")
+    n, nb = X.shape
+    m = E.shape[1]
+    if not 1 <= m <= 12:
+        raise ValueError("exhaustive FCLS supports 1..12 endmembers")
+    A = np.full((n, m), np.nan)
+    rmse = np.full(n, np.nan)
+    finite = np.isfinite(X).all(axis=1)
+    if not finite.any():
+        return A, rmse
+    Xf = X[finite]
+    best_res = np.full(len(Xf), np.inf)
+    best_A = np.zeros((len(Xf), m))
+    for mask in range(1, 1 << m):
+        idx = [j for j in range(m) if (mask >> j) & 1]
+        Es = E[:, idx]
+        Ginv = np.linalg.pinv(Es.T @ Es)
+        g1 = Ginv @ np.ones(len(idx))
+        denom = float(g1.sum())
+        if abs(denom) < 1e-12:
+            continue
+        a_u = Xf @ (Es @ Ginv)                                   # unconstrained LS on this support
+        a = a_u + ((1.0 - a_u.sum(axis=1)) / denom)[:, None] * g1[None, :]   # project onto sum(a) = 1
+        feasible = (a >= -1e-12).all(axis=1)
+        if not feasible.any():
+            continue
+        res = ((Xf - a @ Es.T) ** 2).sum(axis=1)
+        better = np.nonzero(feasible & (res < best_res - 1e-15))[0]
+        if better.size:
+            best_res[better] = res[better]
+            best_A[better] = 0.0
+            best_A[np.ix_(better, idx)] = np.clip(a[better], 0.0, None)
+    A[finite] = best_A
+    rmse[finite] = np.sqrt(best_res / nb)
+    return A, rmse
+
+
+def unmix_scene(scene, valid=None, endmembers=None):
+    """Per-pixel fractional abundances for one scene dict.
+    -> ({endmember name: float32 (H, W) abundance in [0, 1], NaN where invalid}, rmse (H, W))."""
+    E, names = endmember_matrix(endmembers)
+    bands = [np.asarray(scene[b], dtype=np.float64) for b in BAND_NAMES]
+    h, w = bands[0].shape
+    X = np.stack(bands, axis=-1).reshape(-1, len(BAND_NAMES))
+    if valid is not None:
+        X = X.copy()
+        X[~np.asarray(valid, dtype=bool).reshape(-1)] = np.nan
+    A, rmse = fcls_unmix(X, E)
+    return ({n: A[:, i].reshape(h, w).astype(np.float32) for i, n in enumerate(names)},
+            rmse.reshape(h, w).astype(np.float32))
+
+
+# ====================================================================== building-shadow filter
+def detect_building_shadows(scene, *, dark_max=None, window=None, min_std=None, bright=None, min_body_px=None):
+    """Finds pixels that are dark because a building or tree blocks the sun - the classic false 'water' in dense cities.
+
+    Water and shadow are both dark, so brightness alone cannot separate them. What differs is STRUCTURE:
+    a flood is a smooth, compact body; a building shadow is a thin strip lying right next to something very bright.
+    A pixel is flagged `structural` only if ALL of these hold:
+        1. dark          mean reflectance over the available bands <= dark_max
+        2. thin          it is NOT inside a dark body at least `min_body_px` wide (morphological opening)
+        3. high variance the local brightness std in a `window` x `window` neighbourhood >= min_std
+        4. next to light a pixel >= `bright` brightness (roof / concrete) lies within `min_body_px` pixels
+    Sentinel-2 SCL classes 2 (dark area) and 3 (cloud shadow) are reported separately as `scl`.
+    Returns dict of boolean (H, W) masks: scl, structural, combined, dark, plus float32 'local_std'.
+
+    Limits: a genuinely flooded street narrower than min_body_px next to bright buildings is also masked (a 10 m
+    pixel cannot resolve it reliably anyway). Thresholds are expert-set, not validated on labelled Karachi scenes.
+    Topographic (terrain) shadow would need a DEM and the sun angles from the scene metadata - not used here.
     """
     import cv2
+    dark_max = config.SAT_SHADOW_DARK_MAX if dark_max is None else dark_max
+    window = int(config.SAT_SHADOW_WINDOW if window is None else window) | 1
+    min_std = config.SAT_SHADOW_MIN_STD if min_std is None else min_std
+    bright = config.SAT_SHADOW_BRIGHT if bright is None else bright
+    body = int(config.SAT_SHADOW_MIN_BODY_PX if min_body_px is None else min_body_px)
+    names = [b for b in BAND_NAMES if b in scene]
+    if len(names) < 3:
+        raise ValueError("shadow detection needs at least three of green/red/nir/swir")
+    stack = np.stack([np.asarray(scene[b], dtype=np.float32) for b in names])
+    finite = np.isfinite(stack).all(axis=0)
+    shape = finite.shape
+    scl = np.asarray(scene.get("scl", np.zeros(shape, np.uint8)))
+    scl_shadow = np.isin(scl, (2, 3))
+    if not finite.any():
+        z = np.zeros(shape, bool)
+        return {"scl": scl_shadow, "structural": z, "combined": scl_shadow.copy(), "dark": z,
+                "local_std": np.zeros(shape, np.float32)}
+    bright_map = stack.mean(axis=0)
+    fill = float(np.median(bright_map[finite]))
+    B = np.where(finite, bright_map, fill).astype(np.float32)
+    mean = cv2.boxFilter(B, -1, (window, window), borderType=cv2.BORDER_REFLECT)
+    mean2 = cv2.boxFilter(B * B, -1, (window, window), borderType=cv2.BORDER_REFLECT)
+    local_std = np.sqrt(np.maximum(mean2 - mean * mean, 0.0)).astype(np.float32)
+    dark = (B <= dark_max) & finite
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (body, body))
+    bulk = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_OPEN, kern).astype(bool)
+    reach = 2 * body + 1
+    near_bright = cv2.dilate(((B >= bright) & finite).astype(np.uint8), np.ones((reach, reach), np.uint8)).astype(bool)
+    structural = dark & ~bulk & (local_std >= min_std) & near_bright
+    return {"scl": scl_shadow, "structural": structural, "combined": structural | scl_shadow,
+            "dark": dark, "local_std": local_std}
+
+
+def _clear_mask(scene, shadow_filter):
+    """(clear mask, structural-shadow mask or None) for one scene."""
+    valid = valid_mask_from_scl(scene["scl"])
+    if not shadow_filter:
+        return valid, None
+    sh = detect_building_shadows(scene)["structural"]
+    return valid & ~sh, sh
+
+
+# ====================================================================== change metrics
+def _ndwi_gain(event, baselines, ev_struct, base_structs, thr, min_delta, max_ndvi_water):
+    """Index-threshold 'newly wet' mask (the original rule). Returns a dict of arrays."""
+    ndwi_ev, ev_valid = _masked_index(event, "ndwi", ev_struct)
+    ndvi_ev, _ = _masked_index(event, "ndvi", ev_struct)
+    ndwi_base = _nanmedian_stack([_masked_index(b, "ndwi", s)[0] for b, s in zip(baselines, base_structs)])
+    ndvi_base = _nanmedian_stack([_masked_index(b, "ndvi", s)[0] for b, s in zip(baselines, base_structs)])
+    joint = ev_valid & np.isfinite(ndwi_ev) & np.isfinite(ndwi_base)
+    gain = (joint & (ndwi_ev > thr) & (ndwi_base <= thr) & ((ndwi_ev - ndwi_base) >= min_delta)
+            & np.isfinite(ndvi_ev) & (ndvi_ev <= max_ndvi_water))
+    return {"ndwi_ev": ndwi_ev, "ndvi_ev": ndvi_ev, "ndwi_base": ndwi_base, "ndvi_base": ndvi_base,
+            "ev_valid": ev_valid, "joint": joint, "gain": gain}
+
+
+def _filter_speckle(gain, min_cluster_px):
+    """Drops connected patches smaller than min_cluster_px. -> (kept mask, kept areas array)."""
+    import cv2
+    n_c, labels, stats, _ = cv2.connectedComponentsWithStats(gain.astype(np.uint8), connectivity=8)
+    if n_c <= 1:
+        return np.zeros_like(gain, dtype=bool), np.array([], dtype=int)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    keep_ids = np.nonzero(areas >= min_cluster_px)[0] + 1
+    return np.isin(labels, keep_ids), areas[areas >= min_cluster_px]
+
+
+def compute_change_metrics(event, baselines, *, thr=None, min_delta=None, max_ndvi_water=None,
+                           min_cluster_px=None, method=None, shadow_filter=None, endmembers=None):
+    """Compares one event scene against the median of the baseline scenes.
+
+    event / each baseline: dict with float32 reflectance arrays 'green','red','nir' (+ 'swir') and a uint8 'scl'
+    array, all the same shape (a scene dict as returned by SceneProvider.read()).
+
+    method="lsma" (default, needs 'swir'): a pixel is NEWLY WET if, after fully-constrained linear unmixing,
+        its WATER abundance is >= SAT_LSMA_MIN_WATER and rose by >= SAT_LSMA_MIN_DELTA over the baseline median,
+        the unmixing fits well (rmse <= SAT_LSMA_MAX_RMSE, i.e. the pixel really is a mix of the modelled
+        surfaces), and it is clear in the event scene and in at least one baseline scene.
+        Sub-pixel water therefore counts in proportion to its abundance, and concrete/asphalt/vegetation
+        mixtures that merely lower NDWI are not mistaken for water.
+    method="ndwi": the original rule - NDWI > thr, baseline NDWI <= thr, rise >= min_delta, NDVI <= max_ndvi_water.
+    shadow_filter (default config.SAT_SHADOW_FILTER): pixels flagged by detect_building_shadows() are treated as
+        not observable (in the event AND in every baseline scene) before anything is decided.
+    Returns (metrics: dict of plain floats, preview: dict of arrays for plotting).
+    """
     thr = config.SAT_NDWI_THRESHOLD if thr is None else thr
     min_delta = config.SAT_MIN_DELTA_NDWI if min_delta is None else min_delta
     max_ndvi_water = config.SAT_MAX_NDVI_WATER if max_ndvi_water is None else max_ndvi_water
     min_cluster_px = config.SAT_MIN_CLUSTER_PX if min_cluster_px is None else min_cluster_px
+    shadow_filter = config.SAT_SHADOW_FILTER if shadow_filter is None else bool(shadow_filter)
+    method = str(method or config.SAT_METHOD).lower()
+    if method not in ("lsma", "ndwi"):
+        raise ValueError(f"unknown satellite method {method!r}; use 'lsma' or 'ndwi'")
     if not baselines:
         raise ValueError("at least one baseline scene is required")
-
-    ndwi_ev, ev_valid = _masked_index(event, "ndwi")
-    ndvi_ev, _ = _masked_index(event, "ndvi")
-    ndwi_base = _nanmedian_stack([_masked_index(b, "ndwi")[0] for b in baselines])
-    ndvi_base = _nanmedian_stack([_masked_index(b, "ndvi")[0] for b in baselines])
     has_swir = "swir" in event and all("swir" in b for b in baselines)
-    mndwi_ev = _masked_index(event, "mndwi")[0] if has_swir else None
-    mndwi_base = _nanmedian_stack([_masked_index(b, "mndwi")[0] for b in baselines]) if has_swir else None
+    method_used = "lsma" if (method == "lsma" and has_swir) else "ndwi"
+
+    ev_clear, ev_struct = _clear_mask(event, shadow_filter)
+    base_masks = [_clear_mask(b, shadow_filter) for b in baselines]      # (clear, structural shadow) per baseline
+    base_structs = [st for _, st in base_masks]
+    core = _ndwi_gain(event, baselines, ev_struct, base_structs, thr, min_delta, max_ndvi_water)
+    ndwi_ev, ndwi_base, ndvi_ev, ndvi_base = core["ndwi_ev"], core["ndwi_base"], core["ndvi_ev"], core["ndvi_base"]
+    ev_valid, joint = core["ev_valid"], core["joint"]
+    mndwi_ev = _masked_index(event, "mndwi", ev_struct)[0] if has_swir else None
+    mndwi_base = (_nanmedian_stack([_masked_index(b, "mndwi", s)[0] for b, s in zip(baselines, base_structs)])
+                  if has_swir else None)
 
     n_px = int(ndwi_ev.size)
-    joint = ev_valid & np.isfinite(ndwi_ev) & np.isfinite(ndwi_base)
     n_joint = int(joint.sum())
-    m = {"n_pixels": n_px, "n_valid_joint": n_joint,
+    m = {"n_pixels": n_px, "n_valid_joint": n_joint, "method": method_used, "shadow_filter": shadow_filter,
          "valid_fraction_event": _r(float(ev_valid.mean())),
          "joint_valid_fraction": _r(n_joint / n_px if n_px else 0.0),
          "n_baseline_scenes": len(baselines)}
+    if method == "lsma" and not has_swir:
+        m["method_note"] = "no SWIR band available: fell back to the NDWI rule"
+    if shadow_filter:
+        sh_ev = detect_building_shadows(event)
+        m["shadow_frac_event"] = _r(float(sh_ev["combined"].mean()))
+        m["structural_shadow_frac_event"] = _r(float(sh_ev["structural"].mean()))
+        naive = _ndwi_gain(event, baselines, None, [None] * len(baselines), thr, min_delta, max_ndvi_water)
+        naive_kept, _ = _filter_speckle(naive["gain"], min_cluster_px)
+        # how many pixels the unfiltered NDWI rule would have called "newly wet" that sit in building shadow
+        m["shadow_false_positive_px"] = int((naive_kept & sh_ev["structural"]).sum())
+        m["naive_ndwi_gain_frac"] = _r(float(naive_kept.sum()) / max(int(naive["joint"].sum()), 1))
+    else:
+        sh_ev = None
 
     gain = np.zeros_like(joint)
+    w_ev = None
     if n_joint:
         delta = ndwi_ev - ndwi_base
-        gain = (joint & (ndwi_ev > thr) & (ndwi_base <= thr) & (delta >= min_delta)
-                & np.isfinite(ndvi_ev) & (ndvi_ev <= max_ndvi_water))
-        n_c, _, stats, _ = cv2.connectedComponentsWithStats(gain.astype(np.uint8), connectivity=8)
-        areas = stats[1:, cv2.CC_STAT_AREA] if n_c > 1 else np.array([], dtype=int)
-        kept = areas[areas >= min_cluster_px]
-        gain_filtered = int(kept.sum())
-        largest = int(kept.max()) if kept.size else 0
+        if method_used == "lsma":
+            ab_ev, rmse_ev = unmix_scene(event, ev_valid, endmembers)
+            ab_bs = [unmix_scene(b, clear, endmembers) for b, (clear, _) in zip(baselines, base_masks)]
+            w_ev = ab_ev["water"]
+            w_base = _nanmedian_stack([a["water"] for a, _ in ab_bs])
+            fit_ok = np.isfinite(rmse_ev) & (rmse_ev <= config.SAT_LSMA_MAX_RMSE)
+            gain = (joint & fit_ok & np.isfinite(w_ev) & np.isfinite(w_base)
+                    & (w_ev >= config.SAT_LSMA_MIN_WATER) & ((w_ev - w_base) >= config.SAT_LSMA_MIN_DELTA))
+            weight = np.clip(np.nan_to_num(w_ev - w_base), 0.0, 1.0)
+            for nm, key in (("water", "water"), ("vegetation", "veg"), ("impervious", "imperv"), ("shade", "shade")):
+                if nm in ab_ev:
+                    m[f"{key}_abund_event_mean"] = _r(np.nanmean(ab_ev[nm][joint]))
+            m["water_abund_base_mean"] = _r(np.nanmean(w_base[joint & np.isfinite(w_base)])) if np.isfinite(w_base[joint]).any() else None
+            m["fit_rmse_event_mean"] = _r(np.nanmean(rmse_ev[joint]))
+            m["poor_fit_fraction"] = _r(float((~fit_ok[joint]).mean()))
+        else:
+            gain = core["gain"]
+            weight = np.ones(gain.shape, np.float32)
+        kept_mask, kept_areas = _filter_speckle(gain, min_cluster_px)
+        gain_filtered = int(kept_mask.sum())
+        largest = int(kept_areas.max()) if kept_areas.size else 0
+        weighted_area = float(weight[kept_mask].sum())          # water-equivalent pixels (sub-pixel aware)
         m.update({
             "ndwi_event_mean": _r(np.nanmean(ndwi_ev[joint])), "ndwi_base_mean": _r(np.nanmean(ndwi_base[joint])),
             "delta_ndwi_mean": _r(np.nanmean(delta[joint])), "delta_ndwi_p95": _r(np.nanpercentile(delta[joint], 95)),
@@ -226,7 +450,8 @@ def compute_change_metrics(event, baselines, *, thr=None, min_delta=None, max_nd
             "water_frac_base": _r(float((ndwi_base[joint] > thr).mean())),
             "water_gain_frac": _r(float(gain.sum()) / n_joint),
             "water_gain_frac_filtered": _r(gain_filtered / n_joint),
-            "n_gain_clusters": int(kept.size), "largest_gain_cluster_px": largest,
+            "water_equiv_gain_frac": _r(weighted_area / n_joint),
+            "n_gain_clusters": int(kept_areas.size), "largest_gain_cluster_px": largest,
             "scl_water_frac_event": _r(float((np.asarray(event["scl"])[joint] == SCL_WATER).mean())),
         })
         if m["ndvi_event_mean"] is not None and m["ndvi_base_mean"] is not None:
@@ -236,13 +461,18 @@ def compute_change_metrics(event, baselines, *, thr=None, min_delta=None, max_nd
             if ok.any():
                 m["mndwi_event_mean"] = _r(np.nanmean(mndwi_ev[ok]))
                 m["mndwi_base_mean"] = _r(np.nanmean(mndwi_base[ok]))
-        support, area_s, patch_s = support_score(gain_filtered / n_joint, largest)
+        support, area_s, patch_s = support_score(weighted_area / n_joint, largest)
         m.update({"area_score": _r(area_s), "patch_score": _r(patch_s), "support": _r(support)})
+        gain = kept_mask                                        # what the verdict was actually based on
     else:
         m.update({"water_gain_frac": 0.0, "water_gain_frac_filtered": 0.0, "n_gain_clusters": 0,
                   "largest_gain_cluster_px": 0, "support": 0.0})
 
     preview = {"ndwi_event": ndwi_ev, "ndwi_base": ndwi_base, "gain": gain, "valid": joint}
+    if w_ev is not None:
+        preview["water_abundance_event"] = w_ev
+    if sh_ev is not None:
+        preview["shadow"] = sh_ev["combined"]
     return m, preview
 
 
@@ -442,12 +672,18 @@ class SyntheticSatelliteProvider(SceneProvider):
     flood_probability  share of cells that 'flood' in scenes at/after `wet_after`
     cloud_fraction     share of the AOI covered by cloud in those 'event' scenes (0 = clear)
     wet_after          scenes at/after this time show the flood (default: 15 days before now)
+    building_shadows   0..1 density of simulated tall buildings. Each casts a thin, dark, blue-shifted shadow on
+                       the concrete beside it; the shadow falls on a different side in 'event' scenes than in
+                       baseline scenes (different sun geometry), and 70% of shadow pixels are mislabelled as
+                       water by the simulated SCL, as Sen2Cor often does. Stylised stress test for the
+                       shadow filter - real shadows are messier.
     """
     name = "synthetic-offline-simulator"
     is_synthetic = True
 
     def __init__(self, flood_probability=0.6, cloud_fraction=0.0, seed=7, wet_after=None,
-                 cadence_days=5, latency_days=2, now_fn=None):
+                 cadence_days=5, latency_days=2, now_fn=None, building_shadows=0.0):
+        self.building_shadows = float(building_shadows)
         self.flood_probability = float(flood_probability)
         self.cloud_fraction = float(cloud_fraction)
         self.seed = int(seed)
@@ -472,6 +708,35 @@ class SyntheticSatelliteProvider(SceneProvider):
                     out.append(SceneInfo(id=f"SYN-{day:%Y%m%d}", time=t, cloud_cover=cloud))
             day += dt.timedelta(days=1)
         return out
+
+    def _add_buildings(self, cell, noise, is_event, bands, scl, water, n):
+        """Stylised dense-urban block layout: bright roofs, concrete strips on both sides, one side shaded."""
+        green, red, nir, swir = bands
+        roof = (0.20, 0.22, 0.25, 0.30)                      # bright concrete
+        tilt = (0.35, 0.30, 0.15, 0.10)                      # shade keeps blue-ish sky light, loses NIR/SWIR
+        count = int(round(self.building_shadows * 24))
+        taken = np.zeros((n, n), bool)
+        for _ in range(count):
+            h, w = int(cell.integers(7, 13)), int(cell.integers(7, 13))
+            if n < h + 16 or n < w + 16:
+                continue
+            y0, x0 = int(cell.integers(2, n - h - 8)), int(cell.integers(5, n - w - 8))
+            if taken[max(0, y0 - 1):y0 + h + 1, max(0, x0 - 4):x0 + w + 8].any():
+                continue
+            taken[y0:y0 + h, x0 - 4:x0 + w + 7] = True
+            sl = (slice(y0, y0 + h),)
+            for arr, v, t in zip((green, red, nir, swir), roof, tilt):
+                arr[y0:y0 + h, x0 - 3:x0 + w + 3] = v                    # roof + concrete strips either side
+                shade_cols = slice(x0 + w, x0 + w + 3) if is_event else slice(x0 - 3, x0)
+                arr[y0:y0 + h, shade_cols] = v * t                       # the strip that is in shadow
+            shade_cols = slice(x0 + w, x0 + w + 3) if is_event else slice(x0 - 3, x0)
+            block = np.zeros((n, n), bool)
+            block[y0:y0 + h, shade_cols] = True
+            mislabel = block & (noise.random((n, n)) < 0.70)
+            scl[mislabel] = SCL_WATER
+            scl[block & ~mislabel] = 5
+            scl[y0:y0 + h, x0:x0 + w] = 5
+            water[y0:y0 + h, x0 - 3:x0 + w + 3] = False
 
     def read(self, scene, bbox, size_px):
         import cv2
@@ -508,6 +773,8 @@ class SyntheticSatelliteProvider(SceneProvider):
         for arr, w in ((green, 0.07), (red, 0.05), (nir, 0.02), (swir, 0.01)):
             arr[water] = w
         scl = np.where(veg, 4, 5).astype(np.uint8)
+        if self.building_shadows > 0:
+            self._add_buildings(cell, noise, is_event, (green, red, nir, swir), scl, water, n)
         scl[water] = SCL_WATER
         if is_event and self.cloud_fraction > 0:
             cloud = xx < int(self.cloud_fraction * n)
@@ -536,7 +803,9 @@ class SatelliteVerifier:
     """Orchestrates one cross-verification: cache -> scene search -> read -> indices -> verdict -> store.
     Safe to call from worker threads (the asyncio pipeline uses asyncio.to_thread)."""
 
-    def __init__(self, conn, provider=None, *, aoi_radius_m=None, now_fn=None):
+    def __init__(self, conn, provider=None, *, aoi_radius_m=None, now_fn=None, method=None, shadow_filter=None):
+        self.method = method                    # None -> config.SAT_METHOD
+        self.shadow_filter = shadow_filter      # None -> config.SAT_SHADOW_FILTER
         self.conn = conn
         self.provider = provider or PlanetaryComputerProvider()
         self.aoi_radius_m = float(aoi_radius_m or config.SAT_AOI_RADIUS_M)
@@ -651,7 +920,8 @@ class SatelliteVerifier:
             except Exception as exc:
                 notes.append(f"event scene {s.id} unreadable: {type(exc).__name__}")
                 continue
-            metrics, preview = compute_change_metrics(arrays, baselines)
+            metrics, preview = compute_change_metrics(arrays, baselines, method=self.method,
+                                                      shadow_filter=self.shadow_filter)
             vf = metrics["joint_valid_fraction"] or 0.0
             if best is None or vf > best[0]:
                 best = (vf, s, metrics, preview)

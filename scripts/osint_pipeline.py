@@ -53,7 +53,7 @@ from typing import AsyncIterator, Awaitable, Callable, Iterable
 
 import config
 from database import db as kpdb
-from geospatial.gazetteer import geocode_text, known_places
+from geospatial.gazetteer import geocode_text, known_places, privatize_location
 from scripts import osint_text as nlp
 
 log = logging.getLogger(__name__)
@@ -471,18 +471,21 @@ class OSINTPipeline:
     # -- one post
     async def process(self, raw: RawPost, stats: PipelineStats | None = None):
         stats = stats if stats is not None else PipelineStats()
-        text = nlp.redact(raw.text)[:2000]
+        text = nlp.redact(raw.text)[:2000]           # contact details AND coordinates are removed from the stored text
         if not text.strip():
             return None
         a = nlp.analyze_text(text, len(raw.image_urls))
-        geo = None
+        # Geocode from the ORIGINAL text (coordinates are redacted from `text`), then make any precise point private
+        # BEFORE it is stored or handed to the satellite check. See geospatial/gazetteer.py (geo-indistinguishability).
+        author = nlp.author_hash(raw.platform, raw.author)
         if raw.lat is not None and raw.lon is not None:
             geo = {"lat": raw.lat, "lon": raw.lon, "radius_m": 30.0, "method": "source", "place": None}
         else:
-            geo = geocode_text(text)
+            geo = geocode_text(raw.text or "")
+        geo = privatize_location(geo, author_hash=author, is_synthetic=raw.is_synthetic)
         near_dup = self._dups.check(text) if a["hazard_type"] else None
         row = dict(platform=raw.platform, post_id=raw.post_id, url=raw.url,
-                   author_hash=nlp.author_hash(raw.platform, raw.author),
+                   author_hash=author,
                    posted_at=(raw.posted_at or self._now()).astimezone(UTC).isoformat(timespec="seconds"),
                    scraped_at=kpdb.utc_now_iso(), text=text, lang=a["lang"], image_urls=raw.image_urls[:4],
                    hazard_type=a["hazard_type"], hazard_strength=a["hazard_strength"], urgency=a["urgency"],

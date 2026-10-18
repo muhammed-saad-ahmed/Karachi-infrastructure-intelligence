@@ -36,7 +36,7 @@ _load_dotenv()
 
 # ============================================================== 1. core / risk engine
 DB_PATH = os.getenv("KP_DB_PATH", "data/karachi_pulse.db")
-PROCESSING_VERSION = "2.0.0"
+PROCESSING_VERSION = "2.1.0"
 KARACHI_BBOX = (24.70, 66.80, 25.60, 67.60)  # lat_min, lon_min, lat_max, lon_max
 MAX_IMAGE_MB, MAX_VIDEO_MB, MAX_FILES, MAX_VIDEO_SECONDS = 10, 100, 10, 60
 DUP_RADIUS_M = 25.0
@@ -78,6 +78,13 @@ EDGE_MAX_DETECTIONS = 100
 EDGE_NUM_THREADS = int(os.getenv("KP_EDGE_THREADS", "0"))  # 0 = auto (min(4, cpu_count))
 EDGE_HAZARD_CLASSES = ("pothole", "open_manhole", "sewage_overflow")  # fallback names if ONNX metadata has none
 EDGE_CALIBRATION_MIN_IMAGES = 50          # static INT8 quantization refuses to run on fewer real images
+EDGE_CALIB_MIN_UNIQUE_SOURCES = 20        # a calibration set built from fewer distinct real photos is pipeline-test grade only
+# Acceptance bars for an INT8 model vs its FP32 parent (raw output tensors, see computer_vision.edge_onnx.tensor_agreement).
+# Expert-set starting points, not universal constants: tighten them once you have a labelled test set.
+EDGE_INT8_MIN_COSINE = 0.98
+EDGE_INT8_MAX_NRMSE = 0.20
+EDGE_INT8_MIN_TOPK_JACCARD = 0.60
+EDGE_INT8_REQUIRE_SPEEDUP = False         # many laptop CPUs lack the INT8 instructions; slower-than-FP32 is a warning, not a failure
 
 # ============================================================== 3. OSINT scraping pipeline
 OSINT_USER_AGENT = ("KarachiPulseResearchBot/2.0 (+https://github.com/muhammed-saad-ahmed/"
@@ -123,6 +130,42 @@ SAT_CELL_DEG = 0.005                      # ~550 m grid used as the cache key
 SAT_APPLICABILITY = {"waterlogging": 1.0, "sewage_overflow": 0.5, "open_drain": 0.5,
                      "pothole": 0.0, "open_manhole": 0.0, "garbage": 0.0, "road_damage": 0.0,
                      "sign_damage": 0.0, "streetlight": 0.0, "hazard": 0.0}
+
+# ---- 4b. sub-pixel unmixing (LSMA) and building-shadow filter  (geospatial/satellite.py)
+# "lsma": a pixel is newly wet when its fractional WATER abundance (fully-constrained linear unmixing) rose;
+# "ndwi": the original index-threshold rule (kept for comparison / when no SWIR band is available).
+SAT_METHOD = os.getenv("KP_SAT_METHOD", "lsma")
+# Endmember reflectances in band order (green B03, red B04, nir B08, swir B11). GENERIC DEFAULTS typed from
+# typical spectra in the literature - NOT measured on Karachi scenes. Replace with scene-derived pure pixels
+# (or a local spectral library) before trusting abundances quantitatively.
+SAT_ENDMEMBERS = {
+    "water":      (0.07, 0.05, 0.02, 0.01),
+    "vegetation": (0.08, 0.04, 0.40, 0.20),
+    "impervious": (0.14, 0.16, 0.20, 0.24),   # mixed concrete / asphalt / dusty bare ground
+    "shade":      (0.02, 0.02, 0.03, 0.02),   # photometric shade endmember (Adams et al. 1986; Wu 2004)
+}
+SAT_LSMA_MIN_WATER = 0.35                 # event water abundance needed for a pixel to count as wet
+SAT_LSMA_MIN_DELTA = 0.25                 # ...and it must have risen by at least this vs the baseline median
+SAT_LSMA_MAX_RMSE = 0.05                  # unmixing residual (reflectance units); worse fits are 'unmodelled', not wet
+SAT_SHADOW_FILTER = True
+SAT_SHADOW_DARK_MAX = 0.10                # mean 4-band reflectance below this = dark (water AND shadow are dark)
+SAT_SHADOW_WINDOW = 7                     # neighbourhood (px) for the local-variance check
+SAT_SHADOW_MIN_STD = 0.05                 # local brightness std above this = strong structural edge nearby
+SAT_SHADOW_BRIGHT = 0.22                  # a neighbour at least this bright = roof / concrete casting the shadow
+SAT_SHADOW_MIN_BODY_PX = 5                # dark bodies narrower than this (50 m) look like shadow strips, not floods
+
+# ---- 3b. location privacy (geo-indistinguishability, a form of local differential privacy)  geospatial/gazetteer.py
+# Precise coordinates (explicit / source-supplied) get planar-Laplace noise BEFORE anything is stored or sent to the
+# satellite check. epsilon is derived from "privacy level l within radius r": two true locations r metres apart
+# become at most e^l times more distinguishable (Andres et al. 2013). eps = l / r  (per metre).
+PRIVACY_LDP_ENABLED = os.getenv("KP_LDP", "1") != "0"
+PRIVACY_LEVEL = float(os.getenv("KP_LDP_LEVEL", "1.3862943611198906"))     # ln(4)
+PRIVACY_RADIUS_M = float(os.getenv("KP_LDP_RADIUS_M", "100"))              # street level -> eps ~ 0.0139 / m
+PRIVACY_CAP_QUANTILE = 0.999              # noise radius is hard-capped at this quantile -> (eps, delta)-GI, delta <= 1e-3 * (e^(eps d) + 1)
+PRIVACY_STICKY_GRID_DEG = 0.0005          # ~55 m: same author + same spot -> same noise (blocks averaging attacks)
+PRIVACY_PRECISE_METHODS = ("explicit", "source")   # geocoding methods that reveal a person's own position
+# Synthetic demo posts describe no real person, so they keep their simulated coordinates unless this is set to 1.
+PRIVACY_APPLY_TO_SYNTHETIC = os.getenv("KP_LDP_SYNTHETIC", "0") == "1"
 
 # ============================================================== 5. multi-modal evidence fusion
 FUSION_ALGORITHM_VERSION = "1.0.0"

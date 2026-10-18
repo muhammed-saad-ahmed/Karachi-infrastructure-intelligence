@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest
+onnx                    # only for the real INT8 quantization test (tests/test_int8_pipeline.py); others skip without it
+scipy                   # optional: cross-checks of the Lambert-W and FCLS implementations

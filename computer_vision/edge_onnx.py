@@ -433,6 +433,108 @@ def compare_models(fp32_path, int8_path, images, iou_thr=0.5, conf_thr=0.25):
             "note": "Agreement with the FP32 model, not accuracy vs ground truth. Validate in Model Lab."}
 
 
+# ====================================================================== INT8 vs FP32: tensor agreement + latency
+def _load_images(images, limit=None):
+    import cv2
+    if isinstance(images, str):
+        images = [im for im in (cv2.imread(p) for p in list_images(images)) if im is not None]
+    images = list(images)
+    if limit:
+        images = images[:limit]
+    if not images:
+        raise ValueError("no images to evaluate on")
+    return images
+
+
+def _model_input(sess, size=None):
+    inp = sess.get_inputs()[0]
+    static = isinstance(inp.shape[2], int) and isinstance(inp.shape[3], int)
+    hw = (inp.shape[2], inp.shape[3]) if static else (size or (config.EDGE_IMGSZ,) * 2)
+    hw = (hw, hw) if isinstance(hw, int) else tuple(hw)
+    return inp.name, hw
+
+
+def tensor_agreement(fp32_path, int8_path, images, *, size=None, topk=100, limit=None):
+    """Compares the RAW output tensors of the FP32 and INT8 models on the same preprocessed images - the layer
+    where quantization error first shows, before NMS can hide or exaggerate it. Per image it computes
+
+        cosine         cos(angle) between the flattened outputs (1.0 = identical direction)
+        nrmse          ||fp32 - int8|| / ||fp32||  (relative L2 error)
+        sqnr_db        10 log10( sum(fp32^2) / sum((fp32 - int8)^2) )   signal-to-quantization-noise ratio
+        max_abs_diff   largest single-element difference
+        topk_jaccard   for YOLO heads (1, 4+nc, N): overlap of the `topk` highest-scoring anchors in the two models
+    and returns the mean and the WORST value over the images (the worst image is what fails in the field).
+    Shape-agnostic: works for any model pair with the same output shape. This is agreement with FP32, not accuracy."""
+    imgs = _load_images(images, limit)
+    ref, q = make_session(fp32_path, threads=1), make_session(int8_path, threads=1)
+    name_r, hw = _model_input(ref, size)
+    name_q, _ = _model_input(q, size)
+    rows = []
+    nonfinite = 0
+    for img in imgs:
+        blob = preprocess(img, hw)[0]
+        a = np.asarray(ref.run(None, {name_r: blob})[0], dtype=np.float64)
+        b = np.asarray(q.run(None, {name_q: blob})[0], dtype=np.float64)
+        if a.shape != b.shape:
+            raise ValueError(f"output shapes differ: fp32 {a.shape} vs int8 {b.shape}")
+        if not np.isfinite(b).all():
+            nonfinite += 1
+            b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
+        fa, fb = a.ravel(), b.ravel()
+        na, nb = np.linalg.norm(fa), np.linalg.norm(fb)
+        err = float(np.linalg.norm(fa - fb))
+        row = {"cosine": float(fa @ fb / (na * nb)) if na > 0 and nb > 0 else (1.0 if na == nb else 0.0),
+               "nrmse": err / na if na > 0 else (0.0 if err == 0 else float("inf")),
+               "sqnr_db": float(10 * np.log10(max(na ** 2, 1e-30) / max(err ** 2, 1e-30))) if err > 0 else float("inf"),
+               "max_abs_diff": float(np.abs(fa - fb).max())}
+        if a.ndim == 3 and a.shape[1] <= a.shape[2] and a.shape[1] > 4:
+            sa, sb = a[0, 4:].max(axis=0), b[0, 4:].max(axis=0)
+            k = min(topk, sa.size)
+            ta, tb = set(np.argpartition(-sa, k - 1)[:k].tolist()), set(np.argpartition(-sb, k - 1)[:k].tolist())
+            row["topk_jaccard"] = len(ta & tb) / len(ta | tb)
+        rows.append(row)
+
+    def agg(key, fn):
+        vals = [r[key] for r in rows if key in r and np.isfinite(r[key])]
+        return None if not vals else float(fn(vals))
+
+    out = {"n_images": len(imgs), "n_nonfinite_outputs": nonfinite,
+           "cosine_mean": agg("cosine", np.mean), "cosine_worst": agg("cosine", np.min),
+           "nrmse_mean": agg("nrmse", np.mean), "nrmse_worst": agg("nrmse", np.max),
+           "sqnr_db_mean": agg("sqnr_db", np.mean), "max_abs_diff_worst": agg("max_abs_diff", np.max),
+           "topk_jaccard_mean": agg("topk_jaccard", np.mean), "topk_jaccard_worst": agg("topk_jaccard", np.min)}
+    return {k: (round(v, 5) if isinstance(v, float) else v) for k, v in out.items()}
+
+
+def latency_comparison(fp32_path, int8_path, *, size=None, runs=30, warmup=5, threads=None):
+    """Raw session.run() latency of the two models on the same input, interleaved (so thermal drift and background
+    load hit both equally). Returns p50/p95/mean in ms for each, the delta (fp32 - int8) and the speed-up factor.
+    INT8 is NOT automatically faster: it needs VNNI/dot-product CPU instructions to win, so measure on the target device."""
+    ref, q = make_session(fp32_path, threads=threads), make_session(int8_path, threads=threads)
+    name_r, hw = _model_input(ref, size)
+    name_q, _ = _model_input(q, size)
+    blob = preprocess((np.random.default_rng(0).random((hw[0], hw[1], 3)) * 255).astype(np.uint8), hw)[0]
+    for _ in range(warmup):
+        ref.run(None, {name_r: blob})
+        q.run(None, {name_q: blob})
+    t_ref, t_q = [], []
+    for _ in range(runs):
+        t0 = time.perf_counter(); ref.run(None, {name_r: blob}); t1 = time.perf_counter()
+        q.run(None, {name_q: blob}); t2 = time.perf_counter()
+        t_ref.append((t1 - t0) * 1e3)
+        t_q.append((t2 - t1) * 1e3)
+
+    def stats(a):
+        a = np.asarray(a)
+        return {"mean_ms": round(float(a.mean()), 3), "p50_ms": round(float(np.percentile(a, 50)), 3),
+                "p95_ms": round(float(np.percentile(a, 95)), 3)}
+    r, i = stats(t_ref), stats(t_q)
+    return {"runs": runs, "fp32": r, "int8": i, "delta_ms": round(r["mean_ms"] - i["mean_ms"], 3),
+            "speedup_x": round(r["mean_ms"] / i["mean_ms"], 3) if i["mean_ms"] > 0 else None,
+            "size_mb_fp32": round(os.path.getsize(fp32_path) / 1e6, 3),
+            "size_mb_int8": round(os.path.getsize(int8_path) / 1e6, 3)}
+
+
 # ====================================================================== CLI
 def _main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m computer_vision.edge_onnx", description=__doc__.split("\n")[0])
